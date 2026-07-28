@@ -2,7 +2,7 @@
 
 **A trust-on-first-use gate for Claude Code's repo-level configuration.**
 
-[![CI](https://github.com/<you>/repo-trust/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
+[![CI](https://github.com/Christerfines/repo-trust/actions/workflows/ci.yml/badge.svg)](https://github.com/Christerfines/repo-trust/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](#install)
 [![Zero dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](#install)

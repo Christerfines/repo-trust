@@ -19,7 +19,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/<you>/repo-trust"
+Homepage = "https://github.com/Christerfines/repo-trust"
 
 [project.scripts]
 repo-trust = "repo_trust:main"
