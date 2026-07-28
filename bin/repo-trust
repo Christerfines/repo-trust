@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
+exec python3 "$(cd "$(dirname "$SELF")/.." && pwd)/repo_trust.py" "$@"

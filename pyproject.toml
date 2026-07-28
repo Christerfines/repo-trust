@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repo-trust"
+version = "0.2.0"
+description = "A trust-on-first-use gate for Claude Code's repo-level configuration."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.8"
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Topic :: Security",
+]
+
+[project.urls]
+Homepage = "https://github.com/<you>/repo-trust"
+
+[project.scripts]
+repo-trust = "repo_trust:main"
+
+[tool.setuptools]
+py-modules = ["repo_trust"]
+
+[tool.ruff.lint]
+# Keep this to rules that catch real bugs (unused imports/names, syntax
+# errors, undefined names) plus E402, since the hooks/tests intentionally
+# do `sys.path.insert(...)` before importing repo_trust and rely on
+# `# noqa: E402` to say so - not the full stylistic/pedantic rule set.
+select = ["E4", "E7", "E9", "F", "E402"]
