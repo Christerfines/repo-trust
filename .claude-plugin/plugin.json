@@ -1,0 +1,12 @@
+{
+  "name": "repo-trust",
+  "description": "A trust-on-first-use gate for Claude Code's repo-level configuration.",
+  "version": "0.3.0",
+  "author": {
+    "name": "Christer Fines"
+  },
+  "homepage": "https://github.com/Christerfines/repo-trust",
+  "repository": "https://github.com/Christerfines/repo-trust",
+  "license": "Apache-2.0",
+  "repoTrustOrgStoreHash": "16830c7a73323c2ea8b169c32251e2503f633f0673496ce6a8efbc04a0b3a0bb"
+}

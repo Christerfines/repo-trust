@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "repo-trust"
-version = "0.2.0"
+version = "0.3.0"
 description = "A trust-on-first-use gate for Claude Code's repo-level configuration."
 readme = "README.md"
 license = { text = "Apache-2.0" }

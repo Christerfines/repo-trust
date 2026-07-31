@@ -52,10 +52,11 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 STORE_PATH = Path(
     os.environ.get("REPO_TRUST_STORE", str(Path.home() / ".claude" / "security" / "trust-store.json"))
@@ -66,6 +67,28 @@ KEY_PATH = Path(
 SETTINGS_PATH = Path(
     os.environ.get("CLAUDE_SETTINGS_PATH", str(Path.home() / ".claude" / "settings.json"))
 )
+
+# Bundled, read-only org-wide pre-approvals - present only when repo_trust.py
+# is running as part of an installed Claude Code plugin (see .claude-plugin/
+# plugin.json). Absent for a plain git-clone/personal install, which is the
+# normal case and not an error - see load_org_store().
+ORG_TRUST_STORE_PATH = Path(
+    os.environ.get("REPO_TRUST_ORG_STORE", str(Path(__file__).resolve().parent / "org-trust-store.json"))
+)
+PLUGIN_MANIFEST_PATH = Path(
+    os.environ.get("REPO_TRUST_PLUGIN_MANIFEST", str(Path(__file__).resolve().parent / ".claude-plugin" / "plugin.json"))
+)
+ORG_STORE_HASH_FIELD = "repoTrustOrgStoreHash"
+
+# Best-effort locations for Claude Code's OS-level managed-settings.json,
+# used only for the diagnostic `repo-trust mode` check - repo-trust has no
+# other way to see Claude Code's own settings resolution, and this list may
+# not match every install (see detect_managed_mode's docstring).
+MANAGED_SETTINGS_PATHS = [
+    Path("/Library/Application Support/ClaudeCode/managed-settings.json"),  # macOS
+    Path("/etc/claude-code/managed-settings.json"),  # Linux/WSL
+    Path("C:/ProgramData/ClaudeCode/managed-settings.json"),  # Windows (best-effort)
+]
 
 # Files/dirs read or executed by Claude Code, relative to a repo root.
 CONFIG_FILES = [
@@ -138,14 +161,46 @@ INFO_PATTERNS = [
 # .claude/skills, .claude/agents, .claude/commands, .claude/rules, and any
 # file reached via @import from a CLAUDE.md-family file) - not hook scripts
 # or JSON, to keep the false-positive rate down.
-INJECTION_PATTERNS = [
-    (r"ignore (all |any )?(previous|prior|above|earlier) instructions", "phrasing resembles a prompt-injection instruction (heuristic - verify by reading context)"),
-    (r"disregard (the )?(above|previous|prior)", "phrasing resembles a prompt-injection instruction (heuristic - verify by reading context)"),
-    (r"do not (tell|inform|mention|show) (this|it|the user)", "phrasing resembles an instruction to hide actions from the user (heuristic - verify by reading context)"),
-    (r"without (asking|telling|notifying) the user", "phrasing resembles an instruction to bypass user awareness (heuristic - verify by reading context)"),
-    (r"send (this|the|your) (file|contents?|key|credentials?|ssh key|env(ironment)?) to", "phrasing resembles an exfiltration instruction (heuristic - verify by reading context)"),
-    (r"\bexfiltrate\b", "mentions exfiltration explicitly (heuristic - verify by reading context)"),
-]
+#
+# Keyed by verified language rather than one flat list: every language's
+# patterns are applied unconditionally to every NL-surface file (never
+# gated behind a language guess - a wrong guess must never cause a missed
+# detection in a language already covered). Content in a language that
+# isn't a key here isn't silently assumed clean - see
+# find_unverified_language_findings(), which flags exactly that gap instead
+# of hiding it. "en" is the original, long-used set. "sv" is new and, while
+# built to mirror the same six intents, should be read as maintainer-
+# reviewed rather than as battle-tested as "en" - treat with the same
+# "heuristic, verify by reading" posture the messages already ask for.
+INJECTION_PATTERNS_BY_LANG = {
+    "en": [
+        (r"ignore (all |any )?(previous|prior|above|earlier) instructions", "phrasing resembles a prompt-injection instruction (heuristic - verify by reading context)"),
+        (r"disregard (the )?(above|previous|prior)", "phrasing resembles a prompt-injection instruction (heuristic - verify by reading context)"),
+        (r"do not (tell|inform|mention|show) (this|it|the user)", "phrasing resembles an instruction to hide actions from the user (heuristic - verify by reading context)"),
+        (r"without (asking|telling|notifying) the user", "phrasing resembles an instruction to bypass user awareness (heuristic - verify by reading context)"),
+        (r"send (this|the|your) (file|contents?|key|credentials?|ssh key|env(ironment)?) to", "phrasing resembles an exfiltration instruction (heuristic - verify by reading context)"),
+        (r"\bexfiltrate\b", "mentions exfiltration explicitly (heuristic - verify by reading context)"),
+    ],
+    "sv": [
+        (r"ignorera (alla |eventuella )?(tidigare|föregående|ovanstående) instruktioner", "phrasing resembles a prompt-injection instruction, in Swedish (heuristic - verify by reading context)"),
+        (r"bortse från (ovanstående|tidigare|föregående)", "phrasing resembles a prompt-injection instruction, in Swedish (heuristic - verify by reading context)"),
+        (r"(berätta|tala om|visa|nämn) inte .{0,30}(användaren|detta|det)", "phrasing resembles an instruction to hide actions from the user, in Swedish (heuristic - verify by reading context)"),
+        (r"utan att (fråga|berätta för|meddela) användaren", "phrasing resembles an instruction to bypass user awareness, in Swedish (heuristic - verify by reading context)"),
+        (r"skicka (den här|denna|din) (fil\w*|innehåll\w*|nyckel\w*|uppgifter\w*|ssh-nyckel\w*|miljövariabler\w*) till", "phrasing resembles an exfiltration instruction, in Swedish (heuristic - verify by reading context)"),
+        (r"\bexfiltrera\w*\b", "mentions exfiltration explicitly, in Swedish (heuristic - verify by reading context)"),
+    ],
+}
+
+# Cheap, stdlib-only signal for whether a paragraph's language is one we
+# have verified injection-phrasing coverage for, used only to decide
+# whether to raise the "unverified language" WARN below - it never gates
+# which INJECTION_PATTERNS_BY_LANG entries actually get applied.
+LANGUAGE_STOPWORDS = {
+    "en": {"the", "and", "is", "not", "that", "for", "with", "this", "you", "to", "of", "a", "in", "it", "on", "your", "are"},
+    "sv": {"och", "är", "inte", "att", "för", "det", "som", "en", "av", "till", "på", "med", "har", "den", "om", "din", "du"},
+}
+MIN_WORDS_FOR_LANGUAGE_CLASSIFICATION = 6
+MIN_STOPWORD_HITS_FOR_CONFIDENCE = 2
 
 NL_SURFACE_DIRS = (".claude/skills", ".claude/agents", ".claude/commands", ".claude/rules")
 CLAUDE_MD_BASENAMES = ("claude.md", "claude.local.md")
@@ -312,12 +367,15 @@ INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 IMPORT_TOKEN_RE = re.compile(r"(?<!\w)@(~[\w./~-]*|/[\w./~-]*|[\w.][\w./~-]*)")
 
 
-def mask_code_for_imports(text: str):
+def mask_code(text: str):
     """Blank out fenced code blocks and inline code spans (same length, so
-    line/offset numbers stay accurate) before import-token scanning, mirroring
-    Claude Code's own import parser skipping code spans/fences. An unclosed
-    trailing fence is deliberately left un-blanked (scanned, not excluded) and
-    flagged - failing toward detection rather than away from it.
+    line/offset numbers stay accurate) mirroring Claude Code's own import
+    parser skipping code spans/fences. Used both for import-token scanning
+    and for the unverified-language paragraph check, so a code example
+    showing commands in some other language isn't judged as "the file's
+    language." An unclosed trailing fence is deliberately left un-blanked
+    (scanned, not excluded) and flagged - failing toward detection rather
+    than away from it.
     """
     lines = text.split("\n")
     masked = list(lines)
@@ -339,6 +397,91 @@ def mask_code_for_imports(text: str):
             continue  # already blanked as part of a closed fence
         masked[i] = INLINE_CODE_RE.sub(lambda m: " " * len(m.group(0)), line)
     return "\n".join(masked), unclosed_line
+
+
+FRONTMATTER_DELIM_RE = re.compile(r"^---\s*$")
+PARAGRAPH_RE = re.compile(r"[^\n]+(?:\n[^\n]+)*")
+_WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+
+def strip_frontmatter(text: str) -> str:
+    """Blank a leading YAML frontmatter block (---...---), same length as
+    mask_code, so line numbers stay accurate. Frontmatter's English keys
+    (name:, description:) shouldn't be judged as "the file's language" when
+    classifying the actual prose body for the unverified-language check.
+    """
+    lines = text.split("\n")
+    if not lines or not FRONTMATTER_DELIM_RE.match(lines[0]):
+        return text
+    for i in range(1, len(lines)):
+        if FRONTMATTER_DELIM_RE.match(lines[i]):
+            masked = list(lines)
+            for j in range(0, i + 1):
+                masked[j] = " " * len(lines[j])
+            return "\n".join(masked)
+    return text  # unterminated frontmatter marker - malformed/rare, leave as-is rather than guess
+
+
+def _script_is_verified(paragraph: str) -> bool:
+    """False if a majority of the paragraph's alphabetic characters are
+    non-Latin-script - every INJECTION_PATTERNS_BY_LANG entry is a literal
+    Latin-script phrase, so that's unconditionally unverifiable content,
+    regardless of length (no minimum word count applies here - a single
+    non-Latin token is already conclusive)."""
+    alpha_chars = [ch for ch in paragraph if ch.isalpha()]
+    if not alpha_chars:
+        return True  # nothing to judge (digits/punctuation/code-only) - don't flag
+    non_latin = sum(1 for ch in alpha_chars if not unicodedata.name(ch, "LATIN").startswith("LATIN"))
+    return (non_latin / len(alpha_chars)) < 0.5
+
+
+def _guess_verified_language(paragraph: str) -> bool:
+    """For Latin-script paragraphs: True if a verified language's stopwords
+    are confidently present. Below the minimum word count, returns True
+    (benefit of the doubt - too short to reliably classify either way, but
+    still covered by the unconditional script check and by every verified
+    language's patterns running regardless)."""
+    words = [w.lower() for w in _WORD_RE.findall(paragraph)]
+    if len(words) < MIN_WORDS_FOR_LANGUAGE_CLASSIFICATION:
+        return True
+    word_set = set(words)
+    return any(
+        len(word_set & stopwords) >= MIN_STOPWORD_HITS_FOR_CONFIDENCE
+        for stopwords in LANGUAGE_STOPWORDS.values()
+    )
+
+
+def find_unverified_language_findings(rel: str, text: str) -> list:
+    """Per-*paragraph* (not per-file) coverage check for NL-surface content.
+    Classifying a whole file's dominant language would let an attacker keep
+    a CLAUDE.md dominantly English and hide the actual injected instruction
+    in one short non-English paragraph, evading both the language patterns
+    (wrong language) and a file-level coverage verdict (reads as "English,
+    verified"). Judging each paragraph independently closes that gap.
+    """
+    findings = []
+    masked, _unclosed = mask_code(text)
+    masked = strip_frontmatter(masked)
+    verified_langs = ", ".join(sorted(INJECTION_PATTERNS_BY_LANG))
+
+    for m in PARAGRAPH_RE.finditer(masked):
+        para = m.group(0).strip()
+        if not para:
+            continue
+        if _script_is_verified(para) and _guess_verified_language(para):
+            continue
+        line_no = text.count("\n", 0, m.start()) + 1
+        snippet = para.splitlines()[0].strip()[:120]
+        findings.append({
+            "file": rel, "severity": "WARN", "line": line_no,
+            "message": (
+                f"content language not recognized as one of the verified injection-phrasing languages "
+                f"({verified_langs}) - credential/network/structural patterns still apply here, but "
+                f"phrase-based injection detection isn't verified for this text; read it yourself"
+            ),
+            "snippet": snippet,
+        })
+    return findings
 
 
 def _resolve_import_token(importing_file: Path, token: str):
@@ -375,7 +518,7 @@ def resolve_imports(root: Path, files: dict):
         if content is None:
             continue
         text = content.decode("utf-8", errors="replace")
-        masked, unclosed_line = mask_code_for_imports(text)
+        masked, unclosed_line = mask_code(text)
         if unclosed_line is not None:
             findings.append({
                 "file": rel, "severity": "WARN", "line": unclosed_line,
@@ -459,10 +602,12 @@ def analyze(files: dict, root: Path, imported_rels=frozenset()):
                     add(severity, message, m)
 
         if is_nl_surface(rel) or rel in imported_rels:
-            for pattern, message in INJECTION_PATTERNS:
-                m = re.search(pattern, text, re.IGNORECASE)
-                if m:
-                    add("WARN", message, m)
+            for lang_patterns in INJECTION_PATTERNS_BY_LANG.values():
+                for pattern, message in lang_patterns:
+                    m = re.search(pattern, text, re.IGNORECASE)
+                    if m:
+                        add("WARN", message, m)
+            findings.extend(find_unverified_language_findings(rel, text))
 
         for m in re.finditer(ABS_PATH_PATTERN, text):
             try:
@@ -525,6 +670,72 @@ def save_store(store: dict):
         STORE_PATH.chmod(0o600)
     except OSError:
         pass
+
+
+def _read_pinned_org_store_hash():
+    if not PLUGIN_MANIFEST_PATH.is_file():
+        return None
+    try:
+        manifest = json.loads(PLUGIN_MANIFEST_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return manifest.get(ORG_STORE_HASH_FIELD)
+
+
+def load_org_store() -> dict:
+    """Read-only, plugin-bundled org-wide pre-approvals - {"repos": {...}}
+    shaped exactly like the personal store's entries (identity -> configHash
+    + perFileHash), so check_status() can apply the same content-hash
+    equality check for both. The org list only ever skips the *human
+    approval* step (a security reviewer, once, instead of every developer
+    separately) - never the *drift* check.
+
+    Absent entirely for a plain git-clone/personal install - that's the
+    normal case, not an error.
+
+    Integrity comes from a hash of this file pinned into the plugin
+    manifest (`repoTrustOrgStoreHash` in .claude-plugin/plugin.json) rather
+    than a second HMAC signing scheme: the plugin's own distribution channel
+    (reviewed commits, versioned releases) already provides the provenance
+    story for *how the file got installed*; the pin exists to catch *local
+    tampering after install* - the same risk hooks/pre_tool_use.py's guard
+    covers for the personal store. Fails closed in every case where the pin
+    can't be positively confirmed: a present-but-unpinned file is treated
+    the same as a mismatched one, not given a free pass, since a missing
+    pin is exactly what stripping the integrity check would look like.
+    """
+    if not ORG_TRUST_STORE_PATH.is_file():
+        return {"repos": {}}
+    try:
+        raw = ORG_TRUST_STORE_PATH.read_bytes()
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return {"repos": {}, "orgStoreTampered": True}
+
+    pinned_hash = _read_pinned_org_store_hash()
+    if pinned_hash is None or sha256_bytes(raw) != pinned_hash:
+        return {"repos": {}, "orgStoreTampered": True}
+    return data
+
+
+def detect_managed_mode() -> bool:
+    """Best-effort diagnostic check for org-enforced 'managed hooks only'
+    mode, by reading the well-known managed-settings.json locations if
+    present and readable. repo-trust has no other way to see Claude Code's
+    own settings resolution - on some platforms/permission setups the file
+    may exist but not be readable by a normal user, or live somewhere
+    MANAGED_SETTINGS_PATHS doesn't cover, so a False result here means
+    "not detected," not "confirmed absent."
+    """
+    for p in MANAGED_SETTINGS_PATHS:
+        try:
+            if p.is_file():
+                data = json.loads(p.read_text())
+                if data.get("allowManagedHooksOnly"):
+                    return True
+        except (OSError, json.JSONDecodeError):
+            continue
+    return False
 
 
 def mutate_store(mutate_fn, attempts=5):
@@ -675,8 +886,28 @@ def diff_changed_files(entry: dict, files: dict, changed: list) -> dict:
     return diffs
 
 
+def _drift_result(identity: str, combined_hash: str, entry: dict, files: dict, per_file: dict, approved_by: str) -> dict:
+    old_files = entry.get("perFileHash", {})
+    changed = sorted(
+        rel for rel in set(old_files) | set(per_file)
+        if old_files.get(rel) != per_file.get(rel)
+    )
+    diffs = diff_changed_files(entry, files, changed)
+    return {
+        "status": "drifted", "identity": identity, "hash": combined_hash,
+        "changed_files": changed, "diffs": diffs, "approvedBy": approved_by,
+    }
+
+
 def check_status(path: Path) -> dict:
-    """Core gate check used by hooks. Returns dict with status + details."""
+    """Core gate check used by hooks. Returns dict with status + details.
+
+    Checks the personal store first (unchanged from before org support
+    existed); only consults the plugin-bundled org store if there's no
+    personal entry for this identity at all. An org approval requires the
+    same content-hash equality a personal one does - it only ever skips the
+    human-approval step, never the drift check. See load_org_store().
+    """
     path = find_repo_root(path)
     files, _findings, _imported = gather(path)
     if not files:
@@ -687,22 +918,30 @@ def check_status(path: Path) -> dict:
     store = load_store()
     entry = store["repos"].get(identity)
 
-    if entry is None:
-        return {"status": "unapproved", "identity": identity, "hash": combined_hash}
+    if entry is not None:
+        if entry.get("configHash") != combined_hash:
+            return _drift_result(identity, combined_hash, entry, files, per_file, "personal")
+        if not verify_entry(entry, identity, combined_hash):
+            return {"status": "tampered", "identity": identity, "hash": combined_hash}
+        return {
+            "status": "trusted", "identity": identity, "hash": combined_hash,
+            "approvedBy": "personal", "approvedAt": entry.get("approvedAt"),
+        }
 
-    if entry.get("configHash") != combined_hash:
-        old_files = entry.get("perFileHash", {})
-        changed = sorted(
-            rel for rel in set(old_files) | set(per_file)
-            if old_files.get(rel) != per_file.get(rel)
-        )
-        diffs = diff_changed_files(entry, files, changed)
-        return {"status": "drifted", "identity": identity, "hash": combined_hash, "changed_files": changed, "diffs": diffs}
+    org_store = load_org_store()
+    org_entry = org_store.get("repos", {}).get(identity)
+    if org_entry is not None:
+        if org_entry.get("configHash") != combined_hash:
+            return _drift_result(identity, combined_hash, org_entry, files, per_file, "org")
+        return {
+            "status": "trusted", "identity": identity, "hash": combined_hash,
+            "approvedBy": "org", "approvedAt": org_entry.get("approvedAt"), "note": org_entry.get("note"),
+        }
 
-    if not verify_entry(entry, identity, combined_hash):
-        return {"status": "tampered", "identity": identity, "hash": combined_hash}
-
-    return {"status": "trusted", "identity": identity, "hash": combined_hash, "approvedAt": entry.get("approvedAt")}
+    result = {"status": "unapproved", "identity": identity, "hash": combined_hash}
+    if org_store.get("orgStoreTampered"):
+        result["orgStoreTampered"] = True
+    return result
 
 
 def format_block_reason(result: dict, path) -> str:
@@ -714,12 +953,26 @@ def format_block_reason(result: dict, path) -> str:
             f"Run `repo-trust review {path}` in a plain terminal (not through me) to see what its "
             f".claude/ configuration would reach outside the repo, then approve or decline."
         )
+        if result.get("orgStoreTampered"):
+            reason += (
+                "\n\nNote: this installation's org-wide pre-approval list failed its integrity check "
+                "and was ignored entirely (fail closed) - report this to whoever manages your repo-trust "
+                "plugin deployment."
+            )
     elif status == "drifted":
         changed = ", ".join(result.get("changed_files", [])) or "unknown files"
-        reason = (
-            f"Blocked by repo-trust: {result.get('identity')}'s Claude configuration changed since "
-            f"approval ({changed}). Run `repo-trust review {path}` to review the change and re-approve."
-        )
+        if result.get("approvedBy") == "org":
+            reason = (
+                f"Blocked by repo-trust: {result.get('identity')} was pre-approved by your organization, "
+                f"but its Claude configuration has changed since that approval ({changed}). This needs "
+                f"your security team to re-review it centrally - `repo-trust review {path}` can still "
+                f"record a personal approval in the meantime if your policy allows that."
+            )
+        else:
+            reason = (
+                f"Blocked by repo-trust: {result.get('identity')}'s Claude configuration changed since "
+                f"approval ({changed}). Run `repo-trust review {path}` to review the change and re-approve."
+            )
     else:  # tampered
         reason = (
             f"Blocked by repo-trust: {result.get('identity')}'s approval record does not match its "
@@ -838,11 +1091,17 @@ def cmd_status(args):
                         print(f"    {line}")
         elif result["status"] == "tampered":
             print(format_block_reason(result, root))
+        if result.get("orgStoreTampered"):
+            print("WARNING: this installation's org-wide pre-approval list failed its integrity check and was ignored.")
         store = load_store()
         entry = store["repos"].get(result.get("identity"))
         scan = entry.get("lastSecurityScanAt") if entry else None
         print(f"Gate:          {'ENABLED' if gate_enabled(store) else 'DISABLED'}")
         print(f"Security scan: {scan or 'never'}")
+        if result.get("approvedBy"):
+            print(f"Approved by:   {result['approvedBy']}")
+            if result["approvedBy"] == "org" and result.get("note"):
+                print(f"Org note:      {result['note']}")
         if result["status"] == "trusted" and entry and entry.get("riskScoreAtApproval"):
             r = entry["riskScoreAtApproval"]
             n = len(entry.get("findingsAtApproval", []))
@@ -1007,6 +1266,40 @@ def cmd_uninstall_hooks(args):
     return 0
 
 
+def cmd_mode(args):
+    """Diagnostic: is this install likely running under an org-enforced
+    'managed hooks only' policy, and if so, are stale personal install-hooks
+    registrations left behind (harmless, but worth knowing about)."""
+    managed = detect_managed_mode()
+    print(f"Managed hooks-only mode: {'likely ACTIVE' if managed else 'not detected'}")
+    if not managed:
+        print(
+            "(Best-effort check against well-known managed-settings.json locations - it can't see "
+            "managed settings distributed by other means, so this only means 'not detected', not "
+            "'confirmed absent'.)"
+        )
+        return 0
+
+    print("Claude Code will only load managed/SDK/force-enabled-plugin hooks now.")
+    settings = _load_settings()
+    has_stale_user_hooks = any(
+        _is_our_hook_command(h.get("command", ""), script)
+        for event, script in HOOK_SCRIPTS.items()
+        for group in settings.get("hooks", {}).get(event, [])
+        for h in group.get("hooks", [])
+    )
+    if has_stale_user_hooks:
+        print(
+            f"Note: {SETTINGS_PATH} still has repo-trust's user-scope hooks registered from "
+            "`install-hooks` - those are now inert under managed hooks-only mode. Harmless to leave "
+            "in place, or run `repo-trust uninstall-hooks` to clean them up."
+        )
+    org_store = load_org_store()
+    if org_store.get("orgStoreTampered"):
+        print("WARNING: this installation's org-wide pre-approval list failed its integrity check and was ignored.")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(prog="repo-trust", description=__doc__.strip().splitlines()[0])
     parser.add_argument("--version", action="version", version=f"repo-trust {VERSION}")
@@ -1044,6 +1337,9 @@ def main():
 
     p_uninstall = sub.add_parser("uninstall-hooks", help="remove repo-trust's hooks from ~/.claude/settings.json")
     p_uninstall.set_defaults(func=cmd_uninstall_hooks)
+
+    p_mode = sub.add_parser("mode", help="diagnostic: is org-enforced managed hooks-only mode active")
+    p_mode.set_defaults(func=cmd_mode)
 
     args = parser.parse_args()
     sys.exit(args.func(args))

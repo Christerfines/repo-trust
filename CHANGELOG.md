@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.3.0
+
+**Company-wide deployment.** repo-trust now ships as a Claude Code plugin
+(`.claude-plugin/plugin.json`, `hooks/hooks.json`) so an organization can
+force-enable it via `managed-settings.json`'s `enabledPlugins` +
+`allowManagedHooksOnly: true`, guaranteeing every developer runs it without
+relying on each of them individually running `install-hooks`. A plugin can
+also bundle a read-only `org-trust-store.json` so a security team can
+pre-approve common internal repos once instead of every developer
+re-reviewing the same ones separately. New `repo-trust mode` diagnoses
+whether managed-hooks-only mode looks active on a given machine.
+
+This is additive: nothing about the existing single-developer flow
+(`install-hooks`, a personal trust store, `repo-trust review`) changes for
+anyone not using the plugin/managed-settings path.
+
+Two real bypasses were found and fixed during design review, before either
+shipped:
+- An org-approved entry now requires the **same content-hash equality** a
+  personal approval does — matching on identity alone (`git remote add
+  origin <url-of-a-vetted-repo>` on a malicious clone) would otherwise have
+  inherited automatic trust regardless of actual content. An org entry only
+  skips the human-approval step, never the drift check.
+- The bundled `org-trust-store.json`'s integrity is verified against a hash
+  pinned into `plugin.json` (`repoTrustOrgStoreHash`) on every read, and
+  `hooks/pre_tool_use.py`'s guard now also covers both files together —
+  editing the org list *and* the manifest's pin through Claude's own tools
+  would otherwise let a hostile repo recompute a matching hash and defeat
+  the check entirely. A missing or mismatched pin fails closed: the org
+  list is ignored for that run, never silently trusted.
+- Documented plainly rather than glossed over: once `allowManagedHooksOnly`
+  is active, a hostile repo's *own* hooks are already blocked by Claude
+  Code itself — repo-trust's remaining load-bearing value in that mode is
+  `.mcp.json` MCP server risk (not a "hook," so untouched by that setting)
+  and CLAUDE.md/skills/agents/commands/rules content, not hook-blocking.
+  The shell guard stays necessary post-rollout for exactly the MCP-launch
+  timing gap, not less necessary.
+
+**Multi-language injection-phrasing detection**, via a different design
+than "translate the patterns into more languages": `INJECTION_PATTERNS` is
+now `INJECTION_PATTERNS_BY_LANG` (English, plus a new maintainer-reviewed
+Swedish set), with every verified language's patterns applied
+unconditionally to every natural-language surface — never gated behind a
+language guess. Separately, every paragraph (not the whole file) of every
+natural-language surface is checked for whether its language is one of the
+verified ones; a paragraph that isn't produces a WARN saying exactly what
+is and isn't covered, instead of an unverified language silently reading as
+"no injection phrasing found, therefore clean." Classification is
+stdlib-only: Unicode-script detection (unconditional, catches non-Latin
+content even as a single token) plus a small stopword-frequency check for
+Latin-script text (gated behind a minimum word count, since very short text
+can't be reliably classified either way).
+
+Design review caught the naive version of this classifying whole files
+instead of paragraphs — which would have let an attacker keep a `CLAUDE.md`
+dominantly English and hide the actual injected instruction in one short
+non-English sentence, evading both the language patterns (wrong language)
+and the coverage warning (file reads as "English, verified"). Fixed by
+classifying per paragraph before either shipped.
+
+An optional, opt-in, network-requiring `--deep-language-check` (send only
+the already-flagged paragraphs to an LLM for a direct semantic judgment,
+rather than translate-then-regex) is scoped as a Roadmap item, not built
+this release — it's a deliberate, explicit break from the zero-dependency
+default the rest of the tool holds to, so it must never run implicitly.
+
 ## 0.2.0
 
 **Fixed during pre-release review** (an independent pass over this same

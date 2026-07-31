@@ -29,6 +29,7 @@
 - [Detection catalog](#detection-catalog)
 - [Wiring into Claude Code](#wiring-into-claude-code)
 - [The shell guard: closing the first-launch window](#the-shell-guard-closing-the-first-launch-window)
+- [Company-wide deployment](#company-wide-deployment)
 - [Hardening the trust store](#hardening-the-trust-store)
 - [The kill switch](#the-kill-switch)
 - [The `/claude-security` nudge](#the-claude-security-nudge)
@@ -198,6 +199,7 @@ Say yes, and the content hash is recorded. Open the repo in Claude Code — it w
 | `repo-trust launch-check [path]` | Used internally by `shell/guard.sh`. Exit `0` if `claude` should be allowed to launch here (trusted, or gate disabled), exit `1` with the block reason on stderr otherwise. |
 | `repo-trust install-hooks` | Register the three hooks (see [Wiring into Claude Code](#wiring-into-claude-code)) in `~/.claude/settings.json`, pointing at this installation's actual path. Backs up the existing file first, is idempotent on repeat runs, and updates the path in place if you move the install directory and re-run it. |
 | `repo-trust uninstall-hooks` | Remove exactly the hook entries `install-hooks` added, leaving everything else in `~/.claude/settings.json` untouched. |
+| `repo-trust mode` | Diagnostic: best-effort check for whether org-enforced managed hooks-only mode looks active on this machine, and whether stale personal `install-hooks` registrations are left behind. See [Company-wide deployment](#company-wide-deployment). |
 
 `path` defaults to `.` everywhere it's accepted.
 
@@ -261,18 +263,20 @@ Three severities. All heuristic — see [limitations](#threat-model--known-limit
 | inline `python -c "..."` | one-liner that doesn't show up as a reviewable script |
 | absolute paths outside the repo (`/Users/...`, `/home/...`) | filesystem escape |
 
-**WARN (injection phrasing)** — applied only to natural-language instruction surfaces (the CLAUDE.md family, `.claude/skills`, `.claude/agents`, `.claude/commands`, `.claude/rules`, and anything reached via `@import` from a CLAUDE.md-family file), not JSON or hook scripts, to keep the false-positive rate down:
+**WARN (injection phrasing)** — applied only to natural-language instruction surfaces (the CLAUDE.md family, `.claude/skills`, `.claude/agents`, `.claude/commands`, `.claude/rules`, and anything reached via `@import` from a CLAUDE.md-family file), not JSON or hook scripts, to keep the false-positive rate down. Verified in **English and Swedish** — every verified language's patterns run unconditionally against every NL-surface file, regardless of what language the rest of the file is in:
 
-| Pattern catches | Why it matters |
+| Pattern catches (en / sv) | Why it matters |
 |---|---|
-| "ignore (all/previous/prior/above) instructions" | classic injection phrasing |
-| "disregard the above/previous/prior" | classic injection phrasing |
-| "do not tell/inform/mention/show ... the user" | instructs the agent to hide an action |
-| "without asking/telling/notifying the user" | instructs the agent to bypass user awareness |
-| "send this/the/your file/contents/key/credentials/ssh key/env to" | exfiltration phrasing |
-| "exfiltrate" | says the quiet part out loud |
+| "ignore (all/previous/prior/above) instructions" / "ignorera (alla/tidigare/föregående/ovanstående) instruktioner" | classic injection phrasing |
+| "disregard the above/previous/prior" / "bortse från ovanstående/tidigare/föregående" | classic injection phrasing |
+| "do not tell/inform/mention/show ... the user" / "berätta/tala om/visa/nämn inte ... användaren" | instructs the agent to hide an action |
+| "without asking/telling/notifying the user" / "utan att fråga/berätta för/meddela användaren" | instructs the agent to bypass user awareness |
+| "send this/the/your file/contents/key/credentials/ssh key/env to" / "skicka den här/denna/din fil/innehåll/nyckel/uppgifter/ssh-nyckel/miljövariabler till" | exfiltration phrasing |
+| "exfiltrate" / "exfiltrera" | says the quiet part out loud |
 
-These are explicitly heuristic and high-false-positive-tolerant — a `CLAUDE.md` that legitimately discusses prompt injection as a topic will trip these. Read the snippet before acting on it.
+These are explicitly heuristic and high-false-positive-tolerant — a `CLAUDE.md` that legitimately discusses prompt injection as a topic will trip these. Read the snippet before acting on it. The Swedish set is new and maintainer-reviewed rather than as battle-tested as the English one; treat it with the same posture.
+
+**WARN (unverified language)** — rather than silently reading "no injection phrasing found" as "verified clean" when the content simply isn't in a language repo-trust has patterns for, every paragraph of every NL-surface file (after masking out fenced code/inline code spans and stripping YAML frontmatter) is checked for whether its language is one of the verified ones above. Classification happens **per paragraph, not per file** — a `CLAUDE.md` that's overwhelmingly English with one short injected sentence in an unverified language gets that specific sentence flagged, not waved through by the file's overall dominant language. Any paragraph whose alphabetic characters are majority non-Latin-script is flagged unconditionally, with no minimum length (a single non-Latin token is already conclusive, since every verified pattern is a literal Latin-script phrase); a Latin-script paragraph is flagged if it doesn't score a confident stopword match against any verified language, skipped only when it's too short to classify either way. The finding says exactly what is and isn't covered: structural/credential/network patterns (`curl`, `~/.ssh/id_rsa`, `eval(`, etc.) still apply regardless of language, since those match code and paths, not prose — only the phrase-based injection check is what's unverified for that text.
 
 **INFO** — not risky by itself, just worth knowing exists:
 
@@ -346,6 +350,32 @@ echo 'source /absolute/path/to/repo-trust/shell/guard.sh' >> ~/.zshrc   # or ~/.
 
 This closes the gap for terminal launches. It does **not** cover the desktop app or IDE extensions launching Claude Code by other means — say so plainly rather than implying full coverage.
 
+## Company-wide deployment
+
+Everything above describes the personal, single-developer flow — `install-hooks` writing to your own `~/.claude/settings.json`, approvals living in your own local trust store. None of that changes if you never touch this section: it's additive, not a replacement.
+
+For an organization that wants repo-trust's hooks to run for every developer, non-optionally, Claude Code has an actual supported mechanism for this — not something repo-trust invents on top:
+
+- **`managed-settings.json`** at Claude Code's OS-level managed-policy location (highest precedence; individual settings can't override it) supports `allowManagedHooksOnly: true`, which blocks all user- and project-level hooks and loads only managed hooks, SDK hooks, and hooks from plugins force-enabled via `enabledPlugins`.
+- repo-trust ships as a **Claude Code plugin** (`.claude-plugin/plugin.json`, `hooks/hooks.json`) for exactly this — host it in a private, internal-only marketplace (Claude Code supports this directly), then have your security/IT team push `managed-settings.json` with `allowManagedHooksOnly: true` and repo-trust force-enabled via `enabledPlugins`, through whatever device-management tooling you already use (MDM, Ansible, etc.). No developer can silently skip or disable it from there.
+- Run `repo-trust mode` to check whether managed hooks-only mode looks active on a given machine, and whether stale `install-hooks`-registered personal hooks are left behind (harmless, but worth knowing they're now inert).
+
+### Be precise about what this does and doesn't change
+
+Turning on `allowManagedHooksOnly` blocks a hostile repo's *own* hooks itself, org-wide — that part of repo-trust's original job becomes redundant with the org policy once it's active, and this README won't pretend otherwise. What repo-trust still uniquely covers in that mode:
+
+- **`.mcp.json` MCP server definitions** — not "hooks" in Claude Code's sense, so untouched by `allowManagedHooksOnly`. A malicious MCP server config launches an arbitrary binary at session start regardless of this setting.
+- **CLAUDE.md/skills/agents/commands/rules content** — injection-phrasing and credential/network patterns are about what Claude *reads*, not what fires as a hook, so this setting doesn't touch that either.
+- **The audit trail** — a signed record of what was found and approved, and by whom.
+
+Because of the MCP-server point specifically, **[the shell guard](#the-shell-guard-closing-the-first-launch-window) stays necessary after a managed-hooks rollout — if anything, it matters more, not less**: MCP servers launch at the same "before you get a turn" timing a hostile `SessionStart` hook used to, and `allowManagedHooksOnly` has no effect on that. Don't read the managed-hooks rollout as a full replacement for it.
+
+### Centrally pre-approved repos
+
+The plugin can bundle a read-only `org-trust-store.json` at its root: a security reviewer vets a repo once, and every developer inherits that approval instead of separately re-reviewing the same standard internal libraries. This is **not** a weaker, separate trust mechanism — `check_status()` applies the exact same content-hash equality check to an org entry that it applies to a personal one. An org entry only ever skips the *human-approval* step; it never skips the *drift* check. If a pre-approved repo's tracked content changes, it reports `drifted` just like a personal approval would, and `repo-trust status` shows `Approved by: org` so it's never ambiguous where a decision came from.
+
+Integrity for the bundled list works differently from the personal store (no separate HMAC signature) but is held to the same standard: the plugin's own distribution channel (a private repo, reviewed commits, versioned releases) is the provenance story for *how the file got installed*; a hash of `org-trust-store.json` pinned into `plugin.json` (`repoTrustOrgStoreHash`) is checked against the file's actual on-disk content every time it's read, catching *local tampering after install* the same way the personal store's signature and `PreToolUse` guard do. A missing or mismatched pin means the whole org list is ignored for that run — fails closed, never silently trusts a list that might have been altered. `hooks/pre_tool_use.py`'s guard covers both `org-trust-store.json` and the plugin manifest itself, since editing the two together through Claude's own tools would otherwise let a hostile repo recompute a matching hash and defeat the check entirely.
+
 ## Hardening the trust store
 
 `~/.claude/security/trust-store.json` has to be writable by you — which means it's writable by anything running as your OS user, including Claude Code acting on a hostile repo's instructions. No file-permission scheme fully closes that; it's a same-user-code-execution problem, not a tool bug. Two things raise the bar without pretending to solve it:
@@ -390,7 +420,8 @@ Read this section before trusting this tool more than it's earned:
 - **Content-hash approval, not semantic approval.** Re-approving a "drifted" repo means you looked at what changed (the diff is shown to you) and accepted it — the tool has no opinion on whether the change is good.
 - **Not a sandbox.** See [What repo-trust is not](#what-repo-trust-is-not). Nothing here contains what an approved hook does at runtime.
 - **Local trust store, not shared.** Approvals live in `~/.claude/security/trust-store.json` on your machine only (mode `0600`). There is no reputation network, no "other people already flagged this" signal — see [Roadmap](#roadmap).
-- **Injection-phrasing detection is heuristic and English-centric.** It matches specific phrasings, not intent — a differently-worded or non-English injection attempt won't trip it, and legitimate text discussing prompt injection as a topic will.
+- **Injection-phrasing detection is heuristic, verified for English and Swedish, and self-reports the rest as unverified rather than silently passing it.** It matches specific phrasings, not intent — a differently-worded attempt in a verified language, or any attempt at all in a language repo-trust doesn't have patterns for, can still get through the pattern check itself. What's different from a flat "English-only" gap is that content in an unverified language is flagged as such (per paragraph, not per file — see [Detection catalog](#detection-catalog)) instead of being silently treated as clean. Legitimate text discussing prompt injection as a topic will still trip the phrase patterns in either verified language.
+- **The unverified-language check is a cheap stdlib heuristic (Unicode script + stopword frequency), not real language identification.** It's good enough to turn "we can't verify this" into a visible signal, which is the actual goal, but it can misclassify unusual but legitimate text (a paragraph that's mostly proper nouns or technical jargon, say) and it only ever adds caution — it never suppresses a pattern match that would otherwise fire. A `--deep-language-check` mode that asks an LLM directly whether flagged content looks like an injection attempt, in any language, is on the [Roadmap](#roadmap) as an explicitly optional, network-requiring, opt-in addition — never a silent default, since that would be a real break from the zero-dependency posture the rest of this tool holds to.
 - **The nested-`CLAUDE.md` walk prunes and caps for performance.** It skips well-known dependency/build directories (see [What gets scanned](#what-gets-scanned)) and stops past 20,000 candidate files / ~2 seconds, since it runs on every hook invocation, not just `repo-trust review`. A `CLAUDE.md` placed inside a pruned directory is a real, if narrow, blind spot; a repo large enough to hit the cap gets a visible WARN finding rather than a silent gap, but the scan past that point is genuinely incomplete.
 - **`@import` following is heuristic and scoped to the CLAUDE.md family.** The import-token match is a heuristic (it can both over-match prose that merely looks path-shaped and, in principle, miss something Claude Code's own parser would resolve) and doesn't attempt to follow imports from `.claude/rules|skills|agents|commands`, since Claude Code's documentation doesn't confirm `@import` applies there. Treat a clean import scan the same way you'd treat any other heuristic finding here — a pointer, not a verdict.
 - **Repo identity is self-reported, local git config.** `repo_identity()` reads `git config --get remote.origin.url`, which is ordinary local metadata anyone can set to anything (`git remote add origin <any-url>`) — it is not verified against the actual remote. This mostly matters for cosmetics (what name shows up in a block message): the actual trust decision still runs on the content hash and signature, so a spoofed identity colliding with a real approved entry would need matching tracked-file bytes too, not just a matching URL string, and any mismatch there still surfaces as `drifted`, not a false `trusted`.
@@ -409,7 +440,8 @@ Documented and deliberately not built yet — bigger, separable efforts than a s
 - **Sandboxed hook dry-run** — execute a repo's hooks in an isolated environment and observe behavior, instead of only reading source.
 - **Signed-commit / provenance checks** — factor commit signing and repo provenance into the trust decision, not just file contents.
 - **MCP server binary reputation** — beyond regex on `.mcp.json`, resolve and check the actual package/binary a server definition would launch.
-- **Non-English / paraphrased injection-phrasing detection** — the current patterns are narrow on purpose; broadening them without blowing up false positives is real work.
+- **More verified languages beyond English and Swedish** — the architecture (`INJECTION_PATTERNS_BY_LANG`, `LANGUAGE_STOPWORDS`) is data-driven, so adding one is a data change, not a code change; each addition still needs a native or fluent reviewer, not a machine translation, to be trustworthy.
+- **`--deep-language-check`: an optional, opt-in, network-requiring deep pass** — for paragraphs the cheap stdlib check already flagged as unverified-language, send just those paragraphs to an LLM and ask directly whether the text (in any language) instructs hiding actions, exfiltrating data, or overriding prior instructions — a single semantic judgment rather than translate-then-regex, which would inherit both translation-quality loss and the regex's exact-phrasing brittleness. Off by default, positioned the same way `/claude-security` already is: a deeper pass you opt into, not a replacement for the free default.
 
 Issues and PRs proposing any of the above are welcome — see [Contributing](#contributing).
 
